@@ -1,6 +1,6 @@
 services:
   opensandbox-server:
-    image: ${OPENSANDBOX_SERVER_IMAGE:-ghcr.io/huangpustar/fenixagent-opensandbox-server:v0.2.0}
+    image: ${OPENSANDBOX_SERVER_IMAGE:-ghcr.io/yyquiet/opensandbox-server:v0.3.0}
     command: [opensandbox-server, --config, /etc/opensandbox/sandbox.toml]
     privileged: true
     cgroup: host

@@ -5,7 +5,7 @@ description: 在目标机器上用 Docker 启动 OpenSandbox Server，并注册�
 
 # 部署并接入 OpenSandbox 节点
 
-完成目标机器部署、Cluster 注册及健康验证。节点使用镜像 `ghcr.io/huangpustar/fenixagent-opensandbox-server:v0.2.0`，通过容器内独立 Docker daemon 运行沙盒。
+完成目标机器部署、Cluster 注册及健康验证。节点使用镜像 `ghcr.io/yyquiet/opensandbox-server:v0.3.0`，通过容器内独立 Docker daemon 运行沙盒。
 
 ## 1. 确定目标与参数
 

@@ -86,9 +86,7 @@ export function ConnectionHelp({ mode }: { mode?: "direct" | "tunnel" }) {
       {!mode && (
         <p>
           {t("先在目标机器上启动 OpenSandbox Server 节点，再将节点连接到 Cluster。节点镜像：")}
-          <code className="break-all rounded bg-slate-100 px-1 py-0.5">
-            ghcr.io/huangpustar/fenixagent-opensandbox-server:v0.2.0
-          </code>
+          <code className="break-all rounded bg-slate-100 px-1 py-0.5">ghcr.io/yyquiet/opensandbox-server:v0.3.0</code>
           {t("。具体启动方式见")}{" "}
           <a
             className="font-medium text-blue-700 underline underline-offset-4"
