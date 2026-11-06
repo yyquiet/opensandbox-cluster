@@ -1,0 +1,341 @@
+/** Pino logging with request context, redaction and daily file rotation. */
+
+import { AsyncLocalStorage } from "node:async_hooks";
+import { appendFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
+import { Writable } from "node:stream";
+import pino from "pino";
+import pretty from "pino-pretty";
+import { sanitizeLogText, sanitizeLogValue } from "./sanitize";
+import { LOG_SOURCE_PREFIXES, readLogDir } from "./sources";
+
+// ━━━━━ 类型 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/** 请求上下文（等价 Java MDC 的 key 集合） */
+export interface RequestContext {
+  requestId: string;
+  userId?: string;
+  username?: string;
+  organizationId?: string;
+  organizationName?: string;
+  /** 当前请求在 active organization 中的成员角色。 */
+  role?: "owner" | "admin" | "member";
+}
+
+export interface StructuredLogEntry {
+  timestamp: string;
+  level: "info" | "warn" | "error" | "debug";
+  module: string;
+  message: string;
+  requestId?: string;
+  userId?: string;
+  username?: string;
+  organizationId?: string;
+  organizationName?: string;
+  duration?: string;
+  [key: string]: unknown;
+}
+
+export interface Logger {
+  info: (...args: unknown[]) => void;
+  warn: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+  debug: (...args: unknown[]) => void;
+  /** @deprecated 兼容旧 API，内部调用 info */
+  log: (...args: unknown[]) => void;
+  /** 构造结构化日志条目（仅供测试断言） */
+  formatEntry: (
+    level: StructuredLogEntry["level"],
+    message: string,
+    extra?: Record<string, unknown>,
+  ) => StructuredLogEntry;
+}
+
+// ━━━━━ 全局异步上下文存储 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * 请求级上下文传播容器。
+ *
+ * Java 类比：相当于 ThreadLocal<Map<String, String>>（即 MDC 的底层）。
+ * TS 单线程下用 AsyncLocalStorage 追踪异步链，效果等同：
+ *   enterWith({ requestId })  ←→  MDC.put("requestId", id)
+ *   getStore()                ←→  MDC.getCopyOfContextMap()
+ *
+ * 非请求上下文（定时任务、启动阶段）getStore() 返回 undefined，
+ * logger 写入时自动跳过上下文字段，不影响输出。
+ */
+export const requestAls = new AsyncLocalStorage<RequestContext>();
+
+// ━━━━━ 环境检测 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// 仅 bun test 时自动静默，不做环境区分
+const isTest = process.env.NODE_ENV === "test" || (typeof Bun !== "undefined" && !!Bun.env.BUN_TEST);
+const logFormat = process.env.LOG_FORMAT ?? "pretty";
+const logLevel = isTest ? "silent" : (process.env.LOG_LEVEL ?? "info");
+const logDir = readLogDir();
+const logRetentionDays = parseInt(process.env.LOG_RETENTION_DAYS ?? "30", 10);
+const usePretty = logFormat !== "json";
+
+// ━━━━━ 按天滚动文件流 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * 按日期滚动的文件写入流。
+ *
+ * 不依赖 pino-roll（其 worker thread 在 Bun 下有兼容问题），
+ * 直接用 appendFileSync 同步写入，每次写入前检查日期，
+ * 日期变更自动切换到新文件。
+ *
+ * 文件命名：{logDir}/{prefix}.{yyyy-MM-dd}.log
+ * 等价 Java 的 TimeBasedRollingPolicy。
+ */
+class DailyRollingFileStream extends Writable {
+  private currentDate = "";
+  private filePath = "";
+  private cleanedUp = false;
+
+  constructor(
+    private readonly baseDir: string,
+    private readonly prefix: string,
+  ) {
+    super({ decodeStrings: true });
+    mkdirSync(baseDir, { recursive: true });
+  }
+
+  /** 清理超过 retentionDays 的过期日志文件。只在首次日期切换时执行一次。 */
+  private cleanupExpiredLogs(): void {
+    if (this.cleanedUp || logRetentionDays <= 0) return;
+    this.cleanedUp = true;
+    try {
+      const files = readdirSync(this.baseDir);
+      const prefix = `${this.prefix}.`;
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - logRetentionDays);
+      const cutoffStr = cutoff.toISOString().slice(0, 10);
+      for (const file of files) {
+        if (!file.startsWith(prefix) || !file.endsWith(".log")) continue;
+        const dateStr = file.slice(prefix.length, -".log".length);
+        if (dateStr < cutoffStr) {
+          unlinkSync(`${this.baseDir}/${file}`);
+        }
+      }
+    } catch {
+      // 清理失败不影响主流程
+    }
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: Writable _write signature
+  _write(chunk: any, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    try {
+      const today = new Date().toISOString().slice(0, 10); // yyyy-MM-dd
+      if (today !== this.currentDate) {
+        this.currentDate = today;
+        this.filePath = `${this.baseDir}/${this.prefix}.${today}.log`;
+        this.cleanupExpiredLogs();
+      }
+      appendFileSync(this.filePath, chunk);
+      callback();
+    } catch (err) {
+      callback(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+}
+
+// ━━━━━ pino 根实例 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// LOG_FORMAT 控制：
+//   pretty（默认）→ 控制台着色 + 文件滚动
+//   json          → 控制台 JSON + 文件滚动
+// LOG_LEVEL 控制级别（默认 info）
+// LOG_DIR  控制文件目录（默认 logs）
+
+function buildPinoInstance() {
+  const options = {
+    level: logLevel,
+    timestamp: pino.stdTimeFunctions.isoTime,
+    hooks: {
+      logMethod(args, method) {
+        const safeArgs = args.map((arg) => sanitizeLogValue(arg));
+        method.apply(this, safeArgs as Parameters<typeof method>);
+      },
+    },
+    formatters: {
+      level: (label: string, number: number) => ({ level: number, levelLabel: label }),
+      bindings: () => ({}),
+    },
+  } satisfies Parameters<typeof pino>[0];
+
+  // 测试环境：静默
+  if (isTest) {
+    return pino(options);
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: pino.multistream 接受任意 Writable 流
+  const streams: any[] = [];
+
+  // 控制台 + 文件统一级别（LOG_LEVEL 控制）
+  if (usePretty) {
+    streams.push(
+      pretty({
+        colorize: true,
+        translateTime: "SYS:yyyy-mm-dd HH:MM:ss.l",
+        ignore: "pid,hostname",
+        messageFormat: "[{module}] {msg}",
+      }),
+    );
+  } else {
+    streams.push(process.stdout);
+  }
+
+  for (const source of LOG_SOURCE_PREFIXES) {
+    const stream = new DailyRollingFileStream(logDir, source.prefix);
+    streams.push(source.minLevel ? { level: source.minLevel, stream } : stream);
+  }
+
+  return pino(options, pino.multistream(streams));
+}
+
+const pinoInstance = buildPinoInstance();
+
+// ━━━━━ ALS 上下文读取 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * 从 ALS 读取当前请求上下文，合并进日志。
+ *
+ * Java 类比：
+ *   MDC.get("requestId")  → String
+ *   requestAls.getStore() → { requestId, username, orgName, ... }
+ *
+ * 不在请求上下文中（定时任务、启动阶段）时返回空对象，不影响输出。
+ */
+function getAlsContext(): Record<string, unknown> {
+  const store = requestAls.getStore();
+  if (!store) return {};
+  const ctx: Record<string, unknown> = {};
+  // 只写入有值的字段，避免日志中大量 undefined
+  if (store.requestId) ctx.requestId = store.requestId;
+  if (store.userId) ctx.userId = store.userId;
+  if (store.username) ctx.username = store.username;
+  if (store.organizationId) ctx.organizationId = store.organizationId;
+  if (store.organizationName) ctx.organizationName = store.organizationName;
+  return ctx;
+}
+
+// ━━━━━ createLogger ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function argsToMsg(args: unknown[]): [string, Record<string, unknown>?] {
+  const strings: string[] = [];
+  const extras: Record<string, unknown> = {};
+  let hasExtra = false;
+
+  for (const a of args) {
+    if (typeof a === "string") {
+      strings.push(a);
+    } else if (a instanceof Error) {
+      // pino 的 err 序列化会自动输出 message + stack
+      if (strings.length === 0) {
+        const safe = sanitizeLogValue(a) as { message: string };
+        strings.push(safe.message);
+      }
+      extras.err = a;
+      hasExtra = true;
+    } else if (a !== undefined && a !== null) {
+      if (typeof a === "object" && !Array.isArray(a)) {
+        Object.assign(extras, a);
+        hasExtra = true;
+      } else {
+        strings.push(String(a));
+      }
+    }
+  }
+
+  const msg = sanitizeLogText(strings.join(" "), 8192);
+  return hasExtra ? [msg, extras] : [msg];
+}
+
+export function createLogger(module: string): Logger {
+  const child = pinoInstance.child({ module });
+
+  const makeEntry = (
+    level: StructuredLogEntry["level"],
+    message: string,
+    extra?: Record<string, unknown>,
+  ): StructuredLogEntry => ({
+    timestamp: new Date().toISOString(),
+    level,
+    module,
+    message: sanitizeLogText(message, 8192),
+    ...getAlsContext(),
+    ...(sanitizeLogValue(extra ?? {}) as Record<string, unknown>),
+  });
+
+  return {
+    info: (...args: unknown[]) => {
+      const [msg, extras] = argsToMsg(args);
+      child.info({ ...getAlsContext(), ...extras }, msg);
+    },
+    warn: (...args: unknown[]) => {
+      const [msg, extras] = argsToMsg(args);
+      child.warn({ ...getAlsContext(), ...extras }, msg);
+    },
+    error: (...args: unknown[]) => {
+      const [msg, extras] = argsToMsg(args);
+      child.error({ ...getAlsContext(), ...extras }, msg);
+    },
+    debug: (...args: unknown[]) => {
+      const [msg, extras] = argsToMsg(args);
+      child.debug({ ...getAlsContext(), ...extras }, msg);
+    },
+    log: (...args: unknown[]) => {
+      const [msg, extras] = argsToMsg(args);
+      child.info({ ...getAlsContext(), ...extras }, msg);
+    },
+    formatEntry: (level, message, extra) => makeEntry(level, message, extra),
+  };
+}
+
+// ━━━━━ 全局默认导出（兼容旧 import { log, error, warn }） ━━━
+
+const defaultLogger = createLogger("opensandbox-cluster");
+
+export function log(...args: unknown[]): void {
+  defaultLogger.info(...args);
+}
+export function error(...args: unknown[]): void {
+  defaultLogger.error(...args);
+}
+export function warn(...args: unknown[]): void {
+  defaultLogger.warn(...args);
+}
+
+// ━━━━━ 全局 console 拦截 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+// 将裸 console.log / console.warn / console.error 重定向到 pino，
+// 保证项目中所有散落的 console 调用也走统一格式。
+// 拦截归入 [console] 模块，方便在日志中区分。
+
+const consoleLogger = createLogger("console");
+
+export function interceptConsole(): void {
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const originalError = console.error;
+
+  // biome-ignore lint/suspicious/noExplicitAny: console.log 接受任意参数
+  console.log = (...args: any[]) => {
+    if (isTest) return;
+    consoleLogger.info(...args);
+  };
+  // biome-ignore lint/suspicious/noExplicitAny: console.warn 接受任意参数
+  console.warn = (...args: any[]) => {
+    if (isTest) return;
+    consoleLogger.warn(...args);
+  };
+  // biome-ignore lint/suspicious/noExplicitAny: console.error 接受任意参数
+  console.error = (...args: any[]) => {
+    if (isTest) return;
+    consoleLogger.error(...args);
+  };
+
+  // 保留原始引用，供内部需要真正 console 输出时使用
+  // biome-ignore lint/suspicious/noExplicitAny: globalThis 扩展属性
+  (globalThis as any).__originalConsole = { log: originalLog, warn: originalWarn, error: originalError };
+}

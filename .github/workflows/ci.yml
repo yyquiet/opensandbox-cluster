@@ -1,0 +1,22 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.3"
+      - run: bun install --frozen-lockfile
+      - run: bun run precheck
+      - name: Validate node deployments
+        run: |
+          docker compose -f docker/opensandbox-server/docker-compose.yml config --quiet
+          docker compose -f docker/opensandbox-server-tunnel/docker-compose.yml config --quiet
+          docker compose -f skills/deploy-opensandbox-node/assets/compose.yaml -f skills/deploy-opensandbox-node/assets/direct.yaml config --quiet
+          docker compose -f skills/deploy-opensandbox-node/assets/compose.yaml -f skills/deploy-opensandbox-node/assets/tunnel.yaml config --quiet
+          sh -n docker/opensandbox-server/entrypoint.sh
+      - run: docker build -t opensandbox-cluster:ci .

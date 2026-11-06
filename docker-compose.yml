@@ -1,0 +1,32 @@
+services:
+  opensandbox-cluster:
+    build: .
+    image: opensandbox-cluster:local
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATABASE_PATH: /data/opensandbox-cluster.db
+      LOG_DIR: /data/logs
+      FRP_INTERNAL_URL: http://frps:7080
+      CLUSTER_SERVICE_API_KEY: ${CLUSTER_SERVICE_API_KEY:?请在 .env 中设置 CLUSTER_SERVICE_API_KEY}
+      SERVER_API_KEY_ENCRYPTION_KEY: ${SERVER_API_KEY_ENCRYPTION_KEY:?请在 .env 中设置 32 字节加密密钥}
+      FRP_PUBLIC_ADDRESS: ${FRP_PUBLIC_ADDRESS:?请在 .env 中设置节点可达的 FRP 地址}
+      FRP_TOKEN: ${FRP_TOKEN:?请在 .env 中设置 FRP_TOKEN}
+    ports:
+      - "127.0.0.1:${PORT:-8080}:8080"
+    volumes:
+      - ./data:/data
+  frps:
+    image: ghcr.io/fatedier/frps:v0.69.0
+    command: ["-c", "/etc/frp/frps.toml"]
+    restart: unless-stopped
+    environment:
+      FRP_TOKEN: ${FRP_TOKEN:?请在 .env 中设置 FRP_TOKEN}
+    ports:
+      - "${FRP_BIND_PORT:-7000}:7000"
+    volumes:
+      - ./docker/frps.toml:/etc/frp/frps.toml:ro
+    depends_on:
+      - opensandbox-cluster

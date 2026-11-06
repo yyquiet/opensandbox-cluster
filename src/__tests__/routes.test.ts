@@ -1,0 +1,107 @@
+import { describe, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { createApp } from "../app";
+import { migrateDatabase } from "../db/migrate";
+import type { ClusterConfig } from "../types";
+
+const config: ClusterConfig = {
+  port: 8080,
+  host: "127.0.0.1",
+  databasePath: ":memory:",
+  clusterServiceApiKey: "test-key",
+  serverApiKeyEncryptionKey: new Uint8Array(32),
+  proxyConnectTimeoutMs: 3000,
+  proxyResponseTimeoutMs: 120000,
+  frpPluginPort: 8081,
+  frpPublicAddress: "cluster.example.com",
+  frpBindPort: 7000,
+  frpInternalUrl: "http://frps:7080",
+  frpToken: "shared-token",
+  frpConnectionStaleMs: 40000,
+  frpHealthIntervalMs: 30000,
+};
+
+describe("OpenSandbox Cluster routes", () => {
+  test("returns healthy status", async () => {
+    const response = await createApp(config).handle(new Request("http://localhost/health"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "healthy" });
+  });
+
+  test("protects management routes and never returns server API keys", async () => {
+    const databasePath = `/tmp/opensandbox-cluster-routes-${randomUUID()}.db`;
+    migrateDatabase(databasePath);
+    // 显式注入离线探针，避免并发测试替换 globalThis.fetch 后把不可达节点误判为健康。
+    const offlineFetch: typeof fetch = Object.assign(async (): Promise<Response> => {
+      throw new Error("test server is offline");
+    }, fetch);
+    const app = createApp(
+      { ...config, databasePath },
+      {
+        fetch: offlineFetch,
+      },
+    );
+
+    const unauthorized = await app.handle(new Request("http://localhost/api/v1/pools"));
+    expect(unauthorized.status).toBe(401);
+
+    const headers = { Authorization: "Bearer test-key", "Content-Type": "application/json" };
+    const pool = await app.handle(
+      new Request("http://localhost/api/v1/pools", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ id: "pool-route", name: "Route pool" }),
+      }),
+    );
+    expect(pool.status).toBe(200);
+
+    const server = await app.handle(
+      new Request("http://localhost/api/v1/servers", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          id: "server-route",
+          pool_id: "pool-route",
+          name: "Route server",
+          base_url: "http://localhost:65535",
+          workspace_root: "/data/opensandbox/sandboxes",
+          api_key: "secret-api-key",
+          max_sandboxes: 2,
+        }),
+      }),
+    );
+    expect(server.status).toBe(200);
+    const serverBody = (await server.json()) as { healthStatus: string };
+    expect(serverBody.healthStatus).toBe("unhealthy");
+    expect(JSON.stringify(serverBody)).not.toContain("secret-api-key");
+
+    // Tunnel Server 的手动健康检查必须返回当前连接结论，不能把保留的 base_url 当作 Direct 地址解析。
+    const tunnelServer = await app.handle(
+      new Request("http://localhost/api/v1/servers", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          id: "server-tunnel-route",
+          pool_id: "pool-route",
+          name: "Tunnel server",
+          base_url: "12345",
+          workspace_root: "/data/opensandbox/sandboxes",
+          api_key: "secret-tunnel-api-key",
+          max_sandboxes: 2,
+          transport_mode: "tunnel",
+        }),
+      }),
+    );
+    expect(tunnelServer.status).toBe(200);
+
+    const tunnelHealthCheck = await app.handle(
+      new Request("http://localhost/api/v1/servers/server-tunnel-route/health-check", {
+        method: "POST",
+        headers,
+      }),
+    );
+    expect(tunnelHealthCheck.status).toBe(200);
+    const tunnelHealthBody = (await tunnelHealthCheck.json()) as { healthStatus: string };
+    expect(tunnelHealthBody.healthStatus).toBe("unknown");
+  });
+});
